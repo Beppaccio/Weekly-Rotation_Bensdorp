@@ -39,25 +39,21 @@ def generate_pdf(top_picks, spy_status, mdd, total_ret):
     return pdf.output(dest='S').encode('latin-1')
 
 def send_email(recipient_email, pdf_content, spy_status):
-    # Questi valori andrebbero impostati nei "Secrets" di Render o Hostinger
-    sender_email = st.secrets["EMAIL_USER"]
-    sender_password = st.secrets["EMAIL_PASSWORD"]
-    smtp_server = "smtp.gmail.com" # O il server di Hostinger/SendGrid
-    smtp_port = 587
-
-    msg = MIMEMultipart()
-    msg['From'] = sender_email
-    msg['To'] = recipient_email
-    msg['Subject'] = f"📊 Report Trading Settimanale - Regime {spy_status}"
-
-    body = "In allegato trovi il report settimanale generato dalla tua app Bensdorp Weekly Rotation."
-    msg.attach(MIMEText(body, 'plain'))
-
-    part = MIMEApplication(pdf_content, Name=f"Report_{datetime.now().strftime('%Y%m%d')}.pdf")
-    part['Content-Disposition'] = 'attachment; filename="%s"' % f"Report_{datetime.now().strftime('%Y%m%d')}.pdf"
-    msg.attach(part)
-
     try:
+        sender_email = st.secrets["EMAIL_USER"]
+        sender_password = st.secrets["EMAIL_PASSWORD"]
+        smtp_server = "smtp.gmail.com"
+        smtp_port = 587
+
+        msg = MIMEMultipart()
+        msg['From'] = sender_email
+        msg['To'] = recipient_email
+        msg['Subject'] = f"📊 Report Trading Settimanale - Regime {spy_status}"
+        msg.attach(MIMEText("In allegato il report settimanale.", 'plain'))
+        part = MIMEApplication(pdf_content, Name=f"Report_{datetime.now().strftime('%Y%m%d')}.pdf")
+        part['Content-Disposition'] = 'attachment; filename="%s"' % f"Report_{datetime.now().strftime('%Y%m%d')}.pdf"
+        msg.attach(part)
+
         server = smtplib.SMTP(smtp_server, smtp_port)
         server.starttls()
         server.login(sender_email, sender_password)
@@ -65,7 +61,7 @@ def send_email(recipient_email, pdf_content, spy_status):
         server.quit()
         return True
     except Exception as e:
-        st.error(f"Errore invio email: {e}")
+        st.error(f"Errore configurazione Secrets o SMTP: {e}")
         return False
 
 # --- UI SIDEBAR ---
@@ -80,56 +76,82 @@ uploaded_file = st.sidebar.file_uploader("Carica CSV (Colonna 'Ticker')", type=[
 
 # --- LOGICA PRINCIPALE ---
 if uploaded_file:
-    tickers = pd.read_csv(uploaded_file)['Ticker'].tolist()
-    if "SPY" not in tickers: tickers.append("SPY")
-    
-    with st.spinner('Elaborazione dati in corso...'):
-        data = yf.download(tickers, period="2y", interval="1d")['Close']
-        spy_p, spy_sma = data['SPY'].iloc[-1], data['SPY'].rolling(200).mean().iloc[-1]
-        market_bull = spy_p > (spy_sma * (1 + spy_buffer))
-        spy_status = "BULL" if market_bull else "BEAR"
-
-        metrics = []
-        for t in tickers:
-            if t == "SPY": continue
-            s = data[t].dropna()
-            if len(s) < 200: continue
-            p, sma, roc = s.iloc[-1], s.rolling(200).mean().iloc[-1], (s.iloc[-1] / s.iloc[-200]) - 1
-            delta = s.diff()
-            gain, loss = delta.where(delta > 0, 0).rolling(3).mean(), (-delta.where(delta < 0, 0)).rolling(3).mean()
-            rsi = 100 - (100 / (1 + (gain / (loss + 0.001)).iloc[-1]))
-            if p > sma and rsi < rsi_limit:
-                metrics.append({'Ticker': t, 'Price': p, 'ROC': roc, 'RSI3': rsi})
+    try:
+        # Legge il CSV provando diversi separatori (, o ;)
+        df_input = pd.read_csv(uploaded_file, sep=None, engine='python')
+        # Pulisce i nomi delle colonne (toglie spazi vuoti e mette in maiuscolo per il confronto)
+        df_input.columns = [c.strip().capitalize() for c in df_input.columns]
         
-        df_res = pd.DataFrame(metrics).sort_values(by='ROC', ascending=False).head(top_n)
+        if 'Ticker' not in df_input.columns:
+            st.error("Errore: Il file deve contenere una colonna chiamata 'Ticker'.")
+            st.write("Colonne trovate nel tuo file:", list(df_input.columns))
+            st.stop()
+            
+        tickers = df_input['Ticker'].dropna().astype(str).tolist()
+        if "SPY" not in [t.upper() for t in tickers]: tickers.append("SPY")
+        
+        with st.spinner('Scaricamento dati da Yahoo Finance...'):
+            data = yf.download(tickers, period="2y", interval="1d")['Close']
+            
+            # Gestione errore download
+            if data.empty:
+                st.error("Impossibile scaricare i dati. Controlla i simboli nel CSV.")
+                st.stop()
 
-    st.title("📊 Weekly Rotation Dashboard")
-    
-    # Backtest
-    portfolio_prices = data[df_res['Ticker'].tolist()].resample('W-MON').last().pct_change().mean(axis=1)
-    equity_curve = (1 + portfolio_prices).cumprod().fillna(1)
-    dd_series, mdd = calculate_drawdown(equity_curve)
-    
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Regime Mercato", spy_status)
-    c2.metric("Titoli Trovati", len(metrics))
-    c3.metric("Max Drawdown", f"{mdd:.2%}")
+            spy_p = data['SPY'].iloc[-1]
+            spy_sma = data['SPY'].rolling(200).mean().iloc[-1]
+            market_bull = spy_p > (spy_sma * (1 + spy_buffer))
+            spy_status = "BULL" if market_bull else "BEAR"
 
-    st.subheader("🚀 Segnali Attuali")
-    st.table(df_res.style.format({'Price': '{:.2f}', 'ROC': '{:.2%}', 'RSI3': '{:.1f}'}))
-    st.line_chart(equity_curve)
+            metrics = []
+            for t in tickers:
+                if t.upper() == "SPY": continue
+                if t not in data.columns: continue
+                
+                s = data[t].dropna()
+                if len(s) < 200: continue
+                p, sma, roc = s.iloc[-1], s.rolling(200).mean().iloc[-1], (s.iloc[-1] / s.iloc[-200]) - 1
+                delta = s.diff()
+                gain, loss = delta.where(delta > 0, 0).rolling(3).mean(), (-delta.where(delta < 0, 0)).rolling(3).mean()
+                rsi = 100 - (100 / (1 + (gain / (loss + 0.001)).iloc[-1]))
+                if p > sma and rsi < rsi_limit:
+                    metrics.append({'Ticker': t, 'Price': p, 'ROC': roc, 'RSI3': rsi})
+            
+            df_res = pd.DataFrame(metrics).sort_values(by='ROC', ascending=False).head(top_n)
 
-    # --- AZIONI REPORT ---
-    pdf_bytes = generate_pdf(df_res, spy_status, mdd, equity_curve.iloc[-1]-1)
-    
-    col_pdf, col_mail = st.columns(2)
-    col_pdf.download_button("📥 Scarica Report PDF", pdf_bytes, f"Report_{datetime.now().strftime('%Y%m%d')}.pdf", "application/pdf")
-    
-    if col_mail.button("📧 Invia Report via Email"):
-        if email_dest:
-            if send_email(email_dest, pdf_bytes, spy_status):
-                st.success("Email inviata correttamente!")
+        st.title("📊 Weekly Rotation Dashboard")
+        
+        # Backtest
+        portfolio_tickers = df_res['Ticker'].tolist()
+        if portfolio_tickers:
+            portfolio_prices = data[portfolio_tickers].resample('W-MON').last().pct_change().mean(axis=1)
+            equity_curve = (1 + portfolio_prices).cumprod().fillna(1)
+            dd_series, mdd = calculate_drawdown(equity_curve)
+            
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Regime Mercato", spy_status)
+            c2.metric("Titoli Trovati", len(metrics))
+            c3.metric("Max Drawdown", f"{mdd:.2%}")
+
+            st.subheader("🚀 Segnali Attuali")
+            st.table(df_res.style.format({'Price': '{:.2f}', 'ROC': '{:.2%}', 'RSI3': '{:.1f}'}))
+            st.line_chart(equity_curve)
+
+            pdf_bytes = generate_pdf(df_res, spy_status, mdd, equity_curve.iloc[-1]-1)
+            
+            col_pdf, col_mail = st.columns(2)
+            col_pdf.download_button("📥 Scarica Report PDF", pdf_bytes, f"Report_{datetime.now().strftime('%Y%m%d')}.pdf", "application/pdf")
+            
+            if col_mail.button("📧 Invia Report via Email"):
+                if email_dest:
+                    if send_email(email_dest, pdf_bytes, spy_status):
+                        st.success("Email inviata correttamente!")
+                else:
+                    st.warning("Inserisci un indirizzo email nella sidebar.")
         else:
-            st.warning("Inserisci un indirizzo email nella sidebar.")
+            st.warning("Nessun titolo soddisfa i criteri Bensdorp al momento.")
+            
+    except Exception as main_e:
+        st.error(f"Errore durante l'elaborazione: {main_e}")
 else:
     st.warning("Carica un file CSV per iniziare.")
